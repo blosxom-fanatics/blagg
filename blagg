@@ -1,0 +1,99 @@
+#!/usr/bin/perl -w
+
+# Blagg: the Blosxom RSS aggregator
+# Author: Rael Dornfest <rael@oreilly.com>
+# Contributors: Benjamin Trott <ben@rhumba.pair.com>
+# Version: 0+4i
+# Home/Docs/Licensing: http://www.oreillynet.com/~rael/lang/perl/blagg/
+
+# --- Configurable variables -----
+
+# Where are my blog entries kept?
+my $datadir = "/Library/WebServer/Documents/blosxom";
+
+# What external program should I use to grab RSS feeds from remote URLs?
+# Mac OS X default is 'curl'; *nix should like 'lynx -source' or 
+# 'wget --quiet -O -'
+my $get_prog = 'curl';
+
+# --------------------------------
+
+use strict;
+use FileHandle;
+use CGI qw/:standard :netscape/;
+
+die qq{usage: blagg [-mode=(automatic|interactive) [-blog={blogname}]\n}
+	unless param('-mode') && param('-mode') =~ /^(automatic|interactive)$/ && (!param('-blog') || param('-blog') =~ /^([a-zA-Z]\w*)$/);
+
+param('-blog') and $datadir .= '/'.param('-blog');
+
+# Import and initialize plugin, if specified.
+if ( param('-plugin') ) {
+	require('./plugins/' . param('-plugin') . '.pl');
+	blaggplug::init();
+}
+
+my $fh = new FileHandle;
+
+# Does this blog specify any RSS feeds to watch?
+$fh->open("< $datadir/rss.dat") or exit;
+
+# Loop through the feeds in the list and aggregate
+foreach ( <$fh> ) {
+	my($f_nick,$f_url,$f_mode) = split;
+	next unless $f_nick =~ /^\w+$/ && $f_url =~ m#^\w+://# && $f_mode =~ /^(interactive|automatic)$/ && $f_mode eq param('-mode');
+
+	$fh->open("$get_prog '$f_url' |") || next;
+	print "\n_____${f_url}_______________\n";
+	my $rss = join '', <$fh>;
+	$fh->close;
+
+	# Feed's title and link
+	my($f_title, $f_link) = ($rss =~ m#<title>(.*?)</title>.*?<link>(.*?)</link>#ms);
+
+	# RSS items' title, link, and description
+	while ( $rss =~ m{<item(?!s).*?>.*?(?:<title>(.*?)</title>.*?)?(?:<link>(.*?)</link>.*?)?(?:<description>(.*?)</description>.*?)?</item>}mgis ) {
+		my($i_title, $i_link, $i_desc, $i_fn) = ($1||'', $2||'', $3||'', undef);
+
+		# Unescape &amp; &lt; &gt; to produce useful HTML
+		my %unescape = ('&lt;'=>'<', '&gt;'=>'>', '&amp;'=>'&', '&quot;'=>'"'); 
+		my $unescape_re = join '|' => keys %unescape;
+		$i_title && $i_title =~ s/($unescape_re)/$unescape{$1}/g;
+		$i_desc && $i_desc =~ s/($unescape_re)/$unescape{$1}/g;
+
+		# If no title, use the first 50 non-markup characters of the description
+		unless ($i_title) {
+			$i_title = $i_desc;
+			$i_title =~ s/<.*?>//msg;
+			$i_title = substr($i_title, 0, 50);
+		}
+		next unless $i_title;
+
+		# Determine filename
+		($i_fn = $i_title) =~ s/\W/_/g;
+		$i_fn = "$datadir/$f_nick." . substr($i_fn, 0, 15) . '...' . substr($i_fn, -5) . ".txt";
+		
+		# Skip already-aggregated items (aka filename already exists)
+		next if -e $i_fn;
+
+		my $item = "$i_title\n$i_desc<br />\n(" . a({-href=>$i_link},'link') . ") [" . a({-href=>$f_link}, $f_title) . "]\n";
+		my $yn = '';
+		if (param('-mode') eq 'automatic') { 
+			$yn = 'y';
+		} else { 
+			print qq{\n"$i_title"\n[$i_link]\n$i_desc\n\nDo you want to blog this item? (y|n|q)?}; 
+			while (<STDIN>) { 
+				/^([ynq])$/ and $yn = $1, last;
+			};
+		}
+		$yn eq 'q' && exit;
+		# Save entry to file (and via plug-in if specified)
+		$yn eq 'y' && 
+			$fh->open("> $i_fn") && print($fh $item) && $fh->close() &&
+			param('-plugin') && 
+			blaggplug::post($i_title, $i_link, $i_desc, $f_title, $f_link);
+	}
+}
+
+# Clean up plugin, if specified.
+param('-plugin') and blaggplug::destroy();
